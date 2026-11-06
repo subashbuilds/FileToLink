@@ -61,6 +61,9 @@ class Var:
 
     SET_COMMANDS: bool = str_to_bool(os.getenv("SET_COMMANDS", "True"))
 
+    # Audio / subtitle track switching on the stream page (needs ffmpeg + ffprobe on the host)
+    ENABLE_TRACK_SWITCHER: bool = str_to_bool(os.getenv("ENABLE_TRACK_SWITCHER", "True"))
+
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
     if not DATABASE_URL:

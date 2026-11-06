@@ -321,7 +321,9 @@ async def canonical_media_preview(request: web.Request):
 
         file_name = file_record.get("file_name") or f"file_{secure_hash}"
         src = f"{Var.URL.rstrip('/')}/f/{secure_hash}/{quote_media_name(file_name)}"
-        rendered_page = await render_media_page(file_name, src, requested_action='stream')
+        rendered_page = await render_media_page(
+            file_name, src, requested_action='stream', media_key=f"f/{secure_hash}"
+        )
 
         response = web.Response(
             text=rendered_page,
