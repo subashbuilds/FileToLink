@@ -29,7 +29,8 @@ COMMON_HEADERS = {
 }
 NO_STORE = {"Cache-Control": "no-store"}
 
-AUDIO_FIRST_BYTE_TIMEOUT = 120
+AUDIO_FIRST_BYTE_TIMEOUT = 240
+EARLY_HEADERS_AFTER = 8
 MAX_START_SECONDS = 3 * 24 * 3600
 
 
@@ -97,7 +98,7 @@ async def get_subtitle(request: web.Request):
         return _error(404, "Track switching is disabled")
     index = int(request.match_info["index"])
     try:
-        vtt = await mt.request_subtitle(key, url, index)
+        vtt, complete = await mt.request_subtitle(key, url, index)
     except mt.TrackError as e:
         return _error(e.status, e.message)
     except Exception as e:  # noqa: BLE001
@@ -106,16 +107,29 @@ async def get_subtitle(request: web.Request):
         return _error(500, f"Server error occurred: {error_id}")
 
     if vtt is None:
-        # Still converting - the page polls this URL until it gets the file.
+        # Nothing found yet - the page asks again in a moment.
         return web.json_response({"status": "processing"}, status=202,
                                  headers={**COMMON_HEADERS, **NO_STORE, "Retry-After": "2"})
+    # While the file is still being read the cues found so far are returned (X-Subtitle-Complete: 0)
+    # and the page keeps polling until the conversion is complete.
+    cache = "private, max-age=3600" if complete else "no-store"
     return web.Response(text=vtt, content_type="text/vtt", charset="utf-8",
-                        headers={**COMMON_HEADERS, "Cache-Control": "private, max-age=3600"})
+                        headers={**COMMON_HEADERS, "Cache-Control": cache,
+                                 "X-Subtitle-Complete": "1" if complete else "0"})
 
 
 def _client_gone(request: web.Request) -> bool:
     transport = request.transport
     return transport is None or transport.is_closing()
+
+
+def _audio_response(stream: "mt.AudioStream") -> web.StreamResponse:
+    return web.StreamResponse(status=200, headers={
+        **COMMON_HEADERS,
+        **NO_STORE,
+        "Content-Type": stream.mime,
+        "Accept-Ranges": "none",
+    })
 
 
 @routes.get(r"/api/audio/{index:\d+}/{path:.+}", allow_head=False)
@@ -148,18 +162,20 @@ async def get_audio(request: web.Request):
             if chunk is None:
                 if _client_gone(request):
                     return web.Response(status=204)
-                if response is None and time.monotonic() - began > AUDIO_FIRST_BYTE_TIMEOUT:
-                    return _error(504, "Timed out while preparing the audio track")
+                if response is None and time.monotonic() - began > EARLY_HEADERS_AFTER:
+                    # Slow source: send the headers now so a reverse proxy (30-60 s first-byte limits)
+                    # keeps the request open while ffmpeg waits for the file.
+                    response = _audio_response(stream)
+                    await response.prepare(request)
+                if time.monotonic() - began > AUDIO_FIRST_BYTE_TIMEOUT and not stream.has_data:
+                    if response is None:
+                        return _error(504, "Timed out while preparing the audio track")
+                    break
                 continue
             if not chunk:
                 break
             if response is None:
-                response = web.StreamResponse(status=200, headers={
-                    **COMMON_HEADERS,
-                    **NO_STORE,
-                    "Content-Type": stream.mime,
-                    "Accept-Ranges": "none",
-                })
+                response = _audio_response(stream)
                 await response.prepare(request)
             await response.write(chunk)
         if response is None:

@@ -300,34 +300,88 @@ async def probe_tracks(key: str, url: str) -> dict:
 # Subtitles (ffmpeg -> WebVTT)
 # --------------------------------------------------------------------------- #
 _subtitle_sem = asyncio.Semaphore(MAX_SUBTITLE_JOBS)
-_sub_cache: "OrderedDict[str, dict[int, str]]" = OrderedDict()
+_sub_cache: "OrderedDict[str, dict[int, str]]" = OrderedDict()   # finished conversions
+_sub_partial: dict[str, dict[int, str]] = {}                       # what has been found so far
 _sub_jobs: dict[str, asyncio.Task] = {}
 _sub_errors: dict[str, tuple[float, str]] = {}
+SUBTITLE_POLL_INTERVAL = 1.5
 
 
-async def _extract_subtitles(url: str, indexes: list[int]) -> dict[int, str]:
+def _read_vtt_files(tmp: str, indexes: list[int], complete: bool) -> dict[int, str]:
+    """Read the (possibly still growing) WebVTT files ffmpeg is writing."""
+    found: dict[int, str] = {}
+    for idx in indexes:
+        path = Path(tmp) / f"{idx}.vtt"
+        try:
+            text = path.read_text("utf-8", errors="replace")
+        except OSError:
+            continue
+        if not complete:
+            # The last cue may be half written: keep only whole blocks.
+            text = text[: text.rfind("\n\n") + 2] if "\n\n" in text else ""
+        if "-->" in text:
+            found[idx] = text
+    return found
+
+
+async def _extract_subtitles(key: str, url: str, indexes: list[int]) -> dict[int, str]:
     async with _subtitle_sem:
+        started = time.monotonic()
+        logger.info(f"Subtitle extraction started for {key} (tracks {indexes})")
         with tempfile.TemporaryDirectory(prefix="thunder_subs_") as tmp:
             cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                   *_input_args(url, reconnect=True), "-i", url]
+                   *_input_args(url, reconnect=True), "-probesize", "4M", "-analyzeduration", "3M",
+                   "-i", url]
             for idx in indexes:
-                cmd += ["-map", f"0:{idx}", "-c:s", "webvtt", "-f", "webvtt", str(Path(tmp) / f"{idx}.vtt")]
-            rc, _, err = await _run(cmd, SUBTITLE_TIMEOUT)
-            results: dict[int, str] = {}
-            for idx in indexes:
-                path = Path(tmp) / f"{idx}.vtt"
-                if path.exists() and path.stat().st_size > 0:
-                    results[idx] = path.read_text("utf-8", errors="replace")
+                # -flush_packets 1: write every cue to disk immediately so partial results can be served
+                cmd += ["-map", f"0:{idx}", "-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt",
+                        str(Path(tmp) / f"{idx}.vtt")]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            try:
+                # Subtitles are interleaved with the video, so they show up in time order while the
+                # file is being read: publish what has been found every few seconds.
+                while proc.returncode is None:
+                    try:
+                        await asyncio.wait_for(proc.wait(), SUBTITLE_POLL_INTERVAL)
+                    except asyncio.TimeoutError:
+                        pass
+                    if proc.returncode is None:
+                        partial = _read_vtt_files(tmp, indexes, complete=False)
+                        if partial:
+                            _sub_partial[key] = partial
+                        if time.monotonic() - started > SUBTITLE_TIMEOUT:
+                            _kill(proc)
+                            logger.warning(f"Subtitle extraction for {key} timed out")
+            except BaseException:
+                _kill(proc)
+                await _reap(proc)
+                raise
+            finally:
+                _sub_partial.pop(key, None)
+            err = (await stderr_task).decode("utf-8", "replace").strip()
+            results = _read_vtt_files(tmp, indexes, complete=True)
+            elapsed = time.monotonic() - started
             if not results:
-                detail = err.decode("utf-8", "replace").strip()[-300:]
-                logger.warning(f"Subtitle extraction produced nothing (rc={rc}): {detail}")
+                logger.warning(f"Subtitle extraction for {key} produced nothing "
+                               f"(rc={proc.returncode}, {elapsed:.0f}s): {err[-400:]}")
                 raise TrackError(500, "Could not extract the subtitles from this file")
+            if proc.returncode:
+                logger.warning(f"Subtitle extraction for {key} ended early "
+                               f"(rc={proc.returncode}, {elapsed:.0f}s), using what was found: {err[-400:]}")
+            else:
+                logger.info(f"Subtitle extraction for {key} finished in {elapsed:.0f}s")
             return results
 
 
 async def _subtitle_worker(key: str, url: str, indexes: list[int]) -> None:
     try:
-        results = await _extract_subtitles(url, indexes)
+        results = await _extract_subtitles(key, url, indexes)
         _sub_cache[key] = results
         _sub_cache.move_to_end(key)
         while len(_sub_cache) > SUBTITLE_CACHE_SIZE:
@@ -341,8 +395,12 @@ async def _subtitle_worker(key: str, url: str, indexes: list[int]) -> None:
         _sub_jobs.pop(key, None)
 
 
-async def request_subtitle(key: str, url: str, index: int) -> Optional[str]:
-    """Return WebVTT text, or None while the conversion is still running."""
+async def request_subtitle(key: str, url: str, index: int) -> tuple[Optional[str], bool]:
+    """Return ``(webvtt, complete)``.
+
+    ``webvtt`` is None while nothing has been found yet. While the file is still being read it holds
+    the cues found so far and ``complete`` is False - callers should ask again shortly.
+    """
     tracks = await probe_tracks(key, url)
     wanted = next((s for s in tracks["subtitles"] if s["index"] == index), None)
     if wanted is None:
@@ -354,7 +412,7 @@ async def request_subtitle(key: str, url: str, index: int) -> Optional[str]:
     if cached is not None:
         _sub_cache.move_to_end(key)
         if index in cached:
-            return cached[index]
+            return cached[index], True
         raise TrackError(500, "This subtitle track could not be converted")
 
     failed = _sub_errors.get(key)
@@ -366,7 +424,8 @@ async def request_subtitle(key: str, url: str, index: int) -> Optional[str]:
     if key not in _sub_jobs:
         indexes = [s["index"] for s in tracks["subtitles"] if s["supported"]][:MAX_SUBTITLE_TRACKS]
         _sub_jobs[key] = asyncio.create_task(_subtitle_worker(key, url, indexes))
-    return None
+    partial = _sub_partial.get(key, {}).get(index)
+    return partial, False
 
 
 # --------------------------------------------------------------------------- #
@@ -403,6 +462,8 @@ class AudioStream:
         self._err_task: Optional[asyncio.Task] = None
         self._err = b""
         self._counted = False
+        self._opened = 0.0
+        self._first_byte: Optional[float] = None
 
     async def open(self) -> None:
         global _audio_active
@@ -413,7 +474,8 @@ class AudioStream:
         self._counted = True
         encoder, container, self.mime = await _pick_audio_encoder()
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-               *_input_args(self.url, reconnect=True), "-readrate", str(AUDIO_READ_RATE)]
+               *_input_args(self.url, reconnect=True), "-probesize", "4M", "-analyzeduration", "3M",
+               "-readrate", str(AUDIO_READ_RATE)]
         if self.start > 0:
             cmd += ["-ss", f"{self.start:.3f}"]
         cmd += ["-i", self.url, "-map", f"0:{self.index}", "-vn", "-sn", "-dn",
@@ -427,6 +489,8 @@ class AudioStream:
             stderr=asyncio.subprocess.PIPE,
         )
         self._err_task = asyncio.create_task(self._drain_stderr())
+        self._opened = time.monotonic()
+        logger.info(f"Audio stream opened (track {self.index}, start {self.start:.1f}s)")
 
     async def _drain_stderr(self) -> None:
         try:
@@ -439,20 +503,30 @@ class AudioStream:
             return
 
     @property
+    def has_data(self) -> bool:
+        return self._first_byte is not None
+
+    @property
     def error_text(self) -> str:
         return self._err.decode("utf-8", "replace").strip()
 
     async def read(self, size: int = 65536, timeout: float = 2.0) -> Optional[bytes]:
         """Next chunk; b'' at end of stream; None if nothing arrived within ``timeout``."""
         try:
-            return await asyncio.wait_for(self._proc.stdout.read(size), timeout)
+            chunk = await asyncio.wait_for(self._proc.stdout.read(size), timeout)
         except asyncio.TimeoutError:
             return None
+        if chunk and self._first_byte is None:
+            self._first_byte = time.monotonic() - self._opened
+            logger.info(f"Audio track {self.index} (start {self.start:.1f}s): first data after {self._first_byte:.1f}s")
+        return chunk
 
     async def close(self) -> None:
         global _audio_active
         if self._proc is not None:
             _kill(self._proc)
+        if self._proc is not None and self._opened and self._first_byte is None and self._err:
+            logger.warning(f"Audio track {self.index} ended without data: {self.error_text[-400:]}")
         if self._counted:
             self._counted = False
             _audio_active = max(0, _audio_active - 1)

@@ -1,6 +1,7 @@
 # Thunder/utils/custom_dl.py
 
 import asyncio
+import time
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Optional
 
 from pyrogram import Client
@@ -13,6 +14,14 @@ from Thunder.utils.logger import logger
 from Thunder.vars import Var
 
 
+# Short-lived cache of the Telegram message behind a file. Every HTTP request used to cost two
+# get_messages() calls; players and ffmpeg (audio/subtitle tracks) open several range requests per
+# seek, which made streaming slow and could trigger FloodWait.
+_MESSAGE_CACHE: dict[tuple[int, int], tuple[float, Message]] = {}
+_MESSAGE_CACHE_TTL = 300
+_MESSAGE_CACHE_MAX = 512
+
+
 class ByteStreamer:
     __slots__ = ('client', 'chat_id')
 
@@ -21,6 +30,10 @@ class ByteStreamer:
         self.chat_id = int(Var.BIN_CHANNEL)
 
     async def get_message(self, message_id: int) -> Message:
+        cache_key = (self.chat_id, message_id)
+        cached = _MESSAGE_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached[0] < _MESSAGE_CACHE_TTL:
+            return cached[1]
         while True:
             try:
                 message = await self.client.get_messages(self.chat_id, message_id)
@@ -34,6 +47,9 @@ class ByteStreamer:
 
         if not message or not message.media:
             raise FileNotFound(f"Message {message_id} not found")
+        if len(_MESSAGE_CACHE) >= _MESSAGE_CACHE_MAX:
+            _MESSAGE_CACHE.clear()
+        _MESSAGE_CACHE[cache_key] = (time.monotonic(), message)
         return message
 
     async def stream_file(
@@ -80,6 +96,8 @@ class ByteStreamer:
                     await asyncio.sleep(e.value)
                 except Exception as e:
                     last_error = e
+                    if isinstance(ref, int):
+                        _MESSAGE_CACHE.pop((self.chat_id, ref), None)   # maybe a stale file reference
                     logger.debug(f"Error streaming media ref {ref}: {e}", exc_info=True)
                     if started_stream:
                         raise

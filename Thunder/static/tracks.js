@@ -454,14 +454,42 @@
         return res.json().then(function (j) { return j && j.error; }, function () { return null; });
     }
 
-    async function fetchSubtitle(index, token) {
+    /* The server returns the cues found so far (X-Subtitle-Complete: 0) while it is still reading the
+     * file, so subtitles start appearing within seconds and fill in as the conversion progresses. */
+    async function loadSubtitle(index, token) {
         var started = Date.now();
-        while (Date.now() - started < 40 * 60 * 1000) {
+        var gotCues = false;
+        while (Date.now() - started < 45 * 60 * 1000) {
             var res = await fetch(endpoint('subtitle', index), { cache: 'no-store' });
-            if (token !== subToken) throw new Error('cancelled');
-            if (res.status === 202) { await sleep(1500); if (token !== subToken) throw new Error('cancelled'); continue; }
-            if (!res.ok) throw new Error((await errorMessage(res)) || 'Could not load this subtitle track');
-            return res.text();
+            if (token !== subToken) return;
+            if (res.status === 202) {
+                await sleep(1500);
+                if (token !== subToken) return;
+                continue;
+            }
+            if (!res.ok) {
+                if (gotCues) return;   // keep what we already have
+                throw new Error((await errorMessage(res)) || 'Could not load this subtitle track');
+            }
+            var complete = res.headers.get('X-Subtitle-Complete') !== '0';
+            var cues = parseVTT(await res.text());
+            if (token !== subToken) return;
+            S.cues = cues;
+            shownKey = null;
+            if (cues.length && !gotCues) {
+                gotCues = true;
+                showStatus(complete ? 'Subtitles ready' : 'Subtitles are loading in the background…',
+                    { timeout: 3500 });
+                S.subLoading = complete ? null : index;
+                renderMenu();
+            }
+            kickCaptions();
+            if (complete) {
+                S.subLoading = null;
+                return;
+            }
+            await sleep(3000);
+            if (token !== subToken) return;
         }
         throw new Error('Subtitle conversion timed out');
     }
@@ -482,17 +510,14 @@
         S.subSel = index;
         S.subLoading = index;
         renderMenu(); syncButtons();
-        showStatus('Preparing subtitles… the first one can take a moment', { busy: true });
+        showStatus('Reading subtitles from the file… lines appear as they are found', { busy: true });
         try {
-            var text = await fetchSubtitle(index, token);
-            if (token !== subToken) return;
-            S.cues = parseVTT(text);
-            if (!S.cues.length) showStatus('This subtitle track is empty', { timeout: 3500 });
-            else hideStatus();
+            await loadSubtitle(index, token);
+            if (token === subToken && !S.cues.length) showStatus('This subtitle track is empty', { timeout: 3500 });
         } catch (err) {
             if (token !== subToken) return;
             S.subSel = null;
-            showStatus(err.message || 'Could not load subtitles', { error: true, timeout: 5000 });
+            showStatus(err.message || 'Could not load subtitles', { error: true, timeout: 6000 });
         } finally {
             if (token === subToken) {
                 S.subLoading = null;
@@ -517,6 +542,7 @@
         mute: null,
         retries: 0,
         reloadTimer: 0,
+        slowTimer: 0,
         prevMuted: false
     };
 
@@ -610,10 +636,18 @@
         applyRate();
         holdVideo();
         showStatus('Switching audio…', { busy: true });
+        clearTimeout(A.slowTimer);
+        A.slowTimer = setTimeout(function () {
+            if (A.active && !A.ready) {
+                showStatus('Still loading – the server is reading this part of the file from Telegram. ' +
+                    'Pick the original track to cancel.', { busy: true });
+            }
+        }, 8000);
     }
 
     function onAudioReady() {
         if (!A.active || A.ready) return;
+        clearTimeout(A.slowTimer);
         A.ready = true;
         A.retries = 0;
         hideStatus();
@@ -661,6 +695,7 @@
         A.active = false;
         A.ready = false;
         clearTimeout(A.reloadTimer);
+        clearTimeout(A.slowTimer);
         if (A.el) { A.el.pause(); A.el.removeAttribute('src'); A.el.load(); }
         routeVideoAudio(true);
         hideStatus();
